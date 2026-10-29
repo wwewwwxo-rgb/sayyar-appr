@@ -1,5 +1,5 @@
 
-name: Build SAYYAR APK
+name: SAYYAR - Build Complete APK
 
 on:
   workflow_dispatch:
@@ -17,46 +17,459 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Find Flutter project
-        id: project
-        shell: bash
-        run: |
-          echo "Repository files:"
-          ls -la
-          FILE=$(find . -type f -name pubspec.yaml -not -path '*/.dart_tool/*' | head -n 1)
-
-          if [ -z "$FILE" ]; then
-            echo "ERROR: pubspec.yaml not found"
-            exit 1
-          fi
-
-          DIR=$(dirname "$FILE")
-          echo "Flutter project directory: $DIR"
-          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
-
-          if [ ! -f "$DIR/lib/main.dart" ]; then
-            echo "ERROR: lib/main.dart not found in $DIR"
-            find "$DIR" -maxdepth 3 -type f | head -n 80
-            exit 1
-          fi
-
       - name: Install Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: false
 
-      - name: Build APK
-        working-directory: ${{ steps.project.outputs.dir }}
+      - name: Create complete Flutter project
+        shell: bash
         run: |
-          flutter --version
-          flutter pub get
-          dart analyze lib
-          flutter build apk --release
+          set -e
 
-      - name: Upload APK
+          if [ ! -f pubspec.yaml ] || [ ! -f lib/main.dart ]; then
+            flutter create --project-name sayyar --org com.sayyar --platforms android .
+          fi
+
+          mkdir -p lib
+
+          cat > pubspec.yaml <<'EOF'
+          name: sayyar
+          description: SAYYAR Iraq Navigation
+          publish_to: none
+          version: 1.0.0+1
+
+          environment:
+            sdk: '>=3.3.0 <4.0.0'
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            flutter_map: ^8.2.2
+            latlong2: ^0.9.1
+            geolocator: ^14.0.2
+            http: ^1.4.0
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^5.0.0
+
+          flutter:
+            uses-material-design: true
+          EOF
+
+          cat > lib/main.dart <<'EOF'
+          import 'dart:convert';
+          import 'package:flutter/material.dart';
+          import 'package:flutter_map/flutter_map.dart';
+          import 'package:geolocator/geolocator.dart';
+          import 'package:http/http.dart' as http;
+          import 'package:latlong2/latlong.dart';
+
+          const purple = Color(0xFF9B4DFF);
+          const background = Color(0xFF080714);
+          const baghdad = LatLng(33.3152, 44.3661);
+
+          void main() => runApp(const SayyarApp());
+
+          class SayyarApp extends StatelessWidget {
+            const SayyarApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'SAYYAR',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(
+                  useMaterial3: true,
+                  brightness: Brightness.dark,
+                  scaffoldBackgroundColor: background,
+                  colorScheme: ColorScheme.fromSeed(
+                    seedColor: purple,
+                    brightness: Brightness.dark,
+                  ),
+                ),
+                home: const SayyarHome(),
+              );
+            }
+          }
+
+          class SayyarHome extends StatefulWidget {
+            const SayyarHome({super.key});
+
+            @override
+            State<SayyarHome> createState() => _SayyarHomeState();
+          }
+
+          class _SayyarHomeState extends State<SayyarHome> {
+            final MapController map = MapController();
+            final TextEditingController search = TextEditingController();
+            LatLng current = baghdad;
+            LatLng? destination;
+            List<LatLng> route = [];
+            bool locating = false;
+            bool searching = false;
+            String status = 'جاهز للانطلاق';
+            String destinationName = 'حدد وجهتك';
+            double distanceKm = 0;
+
+            @override
+            void dispose() {
+              search.dispose();
+              super.dispose();
+            }
+
+            Future<void> locate() async {
+              if (locating) return;
+              setState(() {
+                locating = true;
+                status = 'جارٍ تحديد موقعك...';
+              });
+              try {
+                if (!await Geolocator.isLocationServiceEnabled()) {
+                  throw Exception('فعّل خدمة الموقع من إعدادات الهاتف');
+                }
+                var permission = await Geolocator.checkPermission();
+                if (permission == LocationPermission.denied) {
+                  permission = await Geolocator.requestPermission();
+                }
+                if (permission == LocationPermission.denied ||
+                    permission == LocationPermission.deniedForever) {
+                  throw Exception('اسمح للتطبيق بالوصول إلى الموقع');
+                }
+                final p = await Geolocator.getCurrentPosition();
+                if (!mounted) return;
+                setState(() {
+                  current = LatLng(p.latitude, p.longitude);
+                  status = 'تم تحديد موقعك';
+                });
+                map.move(current, 15);
+              } catch (e) {
+                if (mounted) {
+                  setState(() => status = e.toString().replaceFirst('Exception: ', ''));
+                }
+              } finally {
+                if (mounted) setState(() => locating = false);
+              }
+            }
+
+            Future<void> findPlace() async {
+              final q = search.text.trim();
+              if (q.isEmpty || searching) return;
+              FocusScope.of(context).unfocus();
+              setState(() {
+                searching = true;
+                status = 'جارٍ البحث...';
+              });
+              try {
+                final uri = Uri.https('nominatim.openstreetmap.org', '/search', {
+                  'q': '$q, Iraq',
+                  'format': 'jsonv2',
+                  'limit': '5',
+                });
+                final response = await http.get(uri, headers: {
+                  'User-Agent': 'SAYYAR-Iraq-Navigation/1.0',
+                  'Accept-Language': 'ar',
+                }).timeout(const Duration(seconds: 15));
+                if (response.statusCode != 200) throw Exception();
+                final items = jsonDecode(response.body) as List<dynamic>;
+                if (!mounted) return;
+                if (items.isEmpty) {
+                  setState(() => status = 'ما لقينا المكان، جرّب اسماً أوضح');
+                  return;
+                }
+                showModalBottomSheet<void>(
+                  context: context,
+                  backgroundColor: const Color(0xFF171329),
+                  isScrollControlled: true,
+                  builder: (ctx) => SafeArea(
+                    child: ListView(
+                      shrinkWrap: true,
+                      padding: const EdgeInsets.all(16),
+                      children: [
+                        const Text('اختر الوجهة',
+                          style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 10),
+                        ...items.map((item) => ListTile(
+                          leading: const Icon(Icons.location_on, color: purple),
+                          title: Text('${item['display_name']}', maxLines: 2,
+                            overflow: TextOverflow.ellipsis),
+                          onTap: () {
+                            final point = LatLng(
+                              double.parse('${item['lat']}'),
+                              double.parse('${item['lon']}'),
+                            );
+                            Navigator.pop(ctx);
+                            setState(() {
+                              destination = point;
+                              destinationName = '${item['display_name']}'.split(',').take(2).join('،');
+                              route = [];
+                              status = 'تم تحديد الوجهة';
+                            });
+                            map.move(point, 14);
+                          },
+                        )),
+                      ],
+                    ),
+                  ),
+                );
+              } catch (_) {
+                if (mounted) setState(() => status = 'فشل البحث؛ تحقق من الإنترنت');
+              } finally {
+                if (mounted) setState(() => searching = false);
+              }
+            }
+
+            Future<void> calculateRoute() async {
+              final target = destination;
+              if (target == null) {
+                setState(() => status = 'ابحث عن وجهة أولاً');
+                return;
+              }
+              setState(() => status = 'جارٍ حساب الطريق...');
+              try {
+                final uri = Uri.parse(
+                  'https://router.project-osrm.org/route/v1/driving/'
+                  '${current.longitude},${current.latitude};'
+                  '${target.longitude},${target.latitude}'
+                  '?overview=full&geometries=geojson',
+                );
+                final response = await http.get(uri).timeout(const Duration(seconds: 25));
+                final body = jsonDecode(response.body) as Map<String, dynamic>;
+                final routes = body['routes'] as List<dynamic>;
+                if (response.statusCode != 200 || routes.isEmpty) throw Exception();
+                final data = routes.first as Map<String, dynamic>;
+                final coords = data['geometry']['coordinates'] as List<dynamic>;
+                final points = coords.map((c) {
+                  final xy = c as List<dynamic>;
+                  return LatLng((xy[1] as num).toDouble(), (xy[0] as num).toDouble());
+                }).toList();
+                if (!mounted) return;
+                setState(() {
+                  route = points;
+                  distanceKm = (data['distance'] as num).toDouble() / 1000;
+                  status = 'تم حساب المسار';
+                });
+                map.fitCamera(CameraFit.coordinates(
+                  coordinates: points,
+                  padding: const EdgeInsets.fromLTRB(35, 130, 35, 210),
+                ));
+              } catch (_) {
+                if (mounted) setState(() => status = 'تعذر حساب الطريق؛ حاول لاحقاً');
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                body: Stack(
+                  children: [
+                    FlutterMap(
+                      mapController: map,
+                      options: const MapOptions(initialCenter: baghdad, initialZoom: 12),
+                      children: [
+                        TileLayer(
+                          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                          userAgentPackageName: 'com.sayyar.sayyar',
+                        ),
+                        if (route.isNotEmpty)
+                          PolylineLayer(polylines: [
+                            Polyline(points: route, strokeWidth: 7, color: purple),
+                          ]),
+                        MarkerLayer(markers: [
+                          Marker(
+                            point: current,
+                            width: 42,
+                            height: 42,
+                            child: const Icon(Icons.navigation, color: Colors.blue, size: 36),
+                          ),
+                          if (destination != null)
+                            Marker(
+                              point: destination!,
+                              width: 44,
+                              height: 44,
+                              child: const Icon(Icons.location_pin, color: Colors.red, size: 42),
+                            ),
+                        ]),
+                        const RichAttributionWidget(
+                          attributions: [TextSourceAttribution('© OpenStreetMap contributors')],
+                        ),
+                      ],
+                    ),
+                    SafeArea(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(14, 10, 14, 0),
+                        child: Column(
+                          children: [
+                            Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(12),
+                                  decoration: BoxDecoration(
+                                    color: background,
+                                    borderRadius: BorderRadius.circular(15),
+                                    border: Border.all(color: purple.withValues(alpha: .7)),
+                                  ),
+                                  child: const Icon(Icons.alt_route, color: purple, size: 27),
+                                ),
+                                const SizedBox(width: 10),
+                                const Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text('SAYYAR', style: TextStyle(
+                                        fontSize: 23, fontWeight: FontWeight.w900,
+                                        letterSpacing: 2)),
+                                      Text('ملاحة العراق', style: TextStyle(color: purple)),
+                                    ],
+                                  ),
+                                ),
+                                IconButton.filled(
+                                  onPressed: locate,
+                                  icon: Icon(locating ? Icons.hourglass_top : Icons.my_location),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 12),
+                            Material(
+                              color: const Color(0xFF111020),
+                              borderRadius: BorderRadius.circular(17),
+                              child: Padding(
+                                padding: const EdgeInsetsDirectional.only(start: 14, end: 5),
+                                child: Row(
+                                  children: [
+                                    const Icon(Icons.search, color: purple),
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: TextField(
+                                        controller: search,
+                                        onSubmitted: (_) => findPlace(),
+                                        decoration: const InputDecoration(
+                                          hintText: 'ابحث عن مكان داخل العراق',
+                                          border: InputBorder.none,
+                                        ),
+                                      ),
+                                    ),
+                                    IconButton(
+                                      onPressed: findPlace,
+                                      icon: const Icon(Icons.arrow_forward, color: purple),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      right: 14,
+                      top: 180,
+                      child: Column(
+                        children: [
+                          FloatingActionButton.small(
+                            heroTag: 'zoom_in',
+                            backgroundColor: background,
+                            onPressed: () => map.move(map.camera.center, map.camera.zoom + 1),
+                            child: const Icon(Icons.add),
+                          ),
+                          const SizedBox(height: 8),
+                          FloatingActionButton.small(
+                            heroTag: 'zoom_out',
+                            backgroundColor: background,
+                            onPressed: () => map.move(map.camera.center, map.camera.zoom - 1),
+                            child: const Icon(Icons.remove),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Positioned(
+                      left: 14,
+                      right: 14,
+                      bottom: 16,
+                      child: Container(
+                        padding: const EdgeInsets.all(18),
+                        decoration: BoxDecoration(
+                          color: const Color(0xF5101022),
+                          borderRadius: BorderRadius.circular(24),
+                          border: Border.all(color: purple.withValues(alpha: .65)),
+                          boxShadow: const [
+                            BoxShadow(color: Colors.black45, blurRadius: 22, offset: Offset(0, 5)),
+                          ],
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Row(
+                              children: [
+                                Container(width: 8, height: 8,
+                                  decoration: const BoxDecoration(color: purple, shape: BoxShape.circle)),
+                                const SizedBox(width: 8),
+                                Expanded(child: Text(status, style: const TextStyle(color: Colors.white70))),
+                              ],
+                            ),
+                            const SizedBox(height: 12),
+                            Text(destinationName, maxLines: 1, overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                            const SizedBox(height: 5),
+                            Text(
+                              route.isEmpty ? 'حدد وجهتك واحسب الطريق' : 'المسافة التقريبية: ${distanceKm.toStringAsFixed(1)} كم',
+                              style: const TextStyle(color: Colors.white60),
+                            ),
+                            const SizedBox(height: 14),
+                            SizedBox(
+                              width: double.infinity,
+                              child: FilledButton.icon(
+                                style: FilledButton.styleFrom(
+                                  backgroundColor: purple,
+                                  foregroundColor: Colors.white,
+                                  padding: const EdgeInsets.all(15),
+                                ),
+                                onPressed: calculateRoute,
+                                icon: const Icon(Icons.alt_route),
+                                label: const Text('احسب الطريق', style: TextStyle(fontWeight: FontWeight.bold)),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("android/app/src/main/AndroidManifest.xml")
+          s = p.read_text()
+          permissions = """
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+          """
+          if "android.permission.INTERNET" not in s:
+              s = s.replace("<application", permissions + "\n    <application", 1)
+          p.write_text(s)
+          PY
+
+      - name: Get packages
+        run: flutter pub get
+
+      - name: Analyze Dart
+        run: dart analyze lib
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Upload SAYYAR APK
         uses: actions/upload-artifact@v4
         with:
           name: SAYYAR-APK
-          path: ${{ steps.project.outputs.dir }}/build/app/outputs/flutter-apk/app-release.apk
+          path: build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
