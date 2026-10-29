@@ -1,0 +1,62 @@
+
+name: Build SAYYAR APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find Flutter project
+        id: project
+        shell: bash
+        run: |
+          echo "Repository files:"
+          ls -la
+          FILE=$(find . -type f -name pubspec.yaml -not -path '*/.dart_tool/*' | head -n 1)
+
+          if [ -z "$FILE" ]; then
+            echo "ERROR: pubspec.yaml not found"
+            exit 1
+          fi
+
+          DIR=$(dirname "$FILE")
+          echo "Flutter project directory: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+          if [ ! -f "$DIR/lib/main.dart" ]; then
+            echo "ERROR: lib/main.dart not found in $DIR"
+            find "$DIR" -maxdepth 3 -type f | head -n 80
+            exit 1
+          fi
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: false
+
+      - name: Build APK
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          flutter --version
+          flutter pub get
+          dart analyze lib
+          flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAYYAR-APK
+          path: ${{ steps.project.outputs.dir }}/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
